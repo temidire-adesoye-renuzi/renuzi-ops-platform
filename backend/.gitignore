@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Environment (contains credentials - never commit)
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# Uploaded files (runtime data, not source)
+uploads/
+
+# Test artifacts
+coverage/
+.jest/
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Editor
+.vscode/
+.idea/

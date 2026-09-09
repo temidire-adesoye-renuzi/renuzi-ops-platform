@@ -1,0 +1,92 @@
+# ============================================================================
+# RENUZI OPS - STAGING STACK (API + SQL Server 2022)
+# Usage:
+#   cp .env.example .env          (fill staging secrets - do NOT commit)
+#   docker compose up -d --build
+#   docker compose exec api npm run migrate
+#
+# Security posture:
+#  - API runs as non-root (Dockerfile)
+#  - SQL uses the least-privilege login (database/03) via DB_USER - create
+#    the login INSIDE the container first (see README_DEPLOY notes below)
+#  - secrets via .env (docker compose interpolation), never baked into images
+#  - mssql data on a named volume; healthchecks gate startup order
+# ============================================================================
+
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: renuzi-mssql-staging
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${DB_SA_PASSWORD:?DB_SA_PASSWORD must be set in .env}"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -No -C || /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P \"$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -No"]
+      interval: 10s
+      timeout: 20s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: renuzi-api-staging
+    depends_on:
+      mssql:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DB_SERVER: mssql
+      DB_PORT: "1433"
+      DB_NAME: RenuziOpsDB
+      DB_USER: ${DB_USER:?DB_USER must be set in .env}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-24h}
+      SYNC_CRON_ENABLED: "true"
+      SYNC_CRON_SCHEDULE: "*/1 * * * *"
+      GRN_CLOSE_CRON_SCHEDULE: "0 * * * *"
+      SWEEP_CRON_ENABLED: "true"
+      SWEEP_CRON_SCHEDULE: "*/5 * * * *"
+      RETENTION_CRON_ENABLED: "true"
+      RETENTION_CRON_SCHEDULE: "15 3 * * *"
+      # Unset defers the retention window to app_config (proc default 30 days)
+      SYNC_CHANGE_LOG_RETENTION_DAYS: "${SYNC_CHANGE_LOG_RETENTION_DAYS:-}"
+      SYNC_STUCK_PROCESSING_MINUTES: "10"
+      SYNC_BACKOFF_BASE_SECONDS: "30"
+      UPLOAD_STORAGE_DRIVER: local
+      UPLOAD_LOCAL_DIR: /app/uploads
+      UPLOAD_MAX_BYTES: "10485760"
+      UPLOAD_ALLOWED_MIME: "image/jpeg,image/png,image/webp,application/pdf"
+      VIRUS_SCAN_HOST: "${VIRUS_SCAN_HOST:-}"
+      VIRUS_SCAN_PORT: "${VIRUS_SCAN_PORT:-3310}"
+      UPLOAD_SIGNED_URL_TTL: "900"
+    ports:
+      - "3000:3000"
+    volumes:
+      - uploads-data:/app/uploads
+    restart: unless-stopped
+
+volumes:
+  mssql-data:
+  uploads-data:
+
+# ----------------------------------------------------------------------------
+# STAGING BOOTSTRAP (one-time, from the host):
+#   1. docker compose exec mssql /opt/mssql-tools18/bin/sqlcmd \
+#        -S localhost -U sa -P "$DB_SA_PASSWORD" \
+#        -i /dev/stdin < database/03_least_privilege.sql
+#      (edit <APP_PASSWORD> in the script to the staging app password first,
+#       matching .env DB_PASSWORD)
+#   2. docker compose exec api npm run migrate
+#   3. docker compose exec mssql /opt/mssql-tools18/bin/sqlcmd ... \
+#        -i /dev/stdin < database/04_force_password_rotation.sql
+# ----------------------------------------------------------------------------
