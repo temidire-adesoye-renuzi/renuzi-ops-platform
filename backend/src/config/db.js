@@ -58,6 +58,7 @@ const PARAM_TYPE_MAP = {
   warehouseSignedByKey: sql.Int, securitySignedByKey: sql.Int, assignedDriverKey: sql.Int,
   assignedVehicleKey: sql.Int, supplierKey: sql.Int, offset: sql.Int, limit: sql.Int,
   referenceKey: sql.Int, fromBusinessKey: sql.Int, toBusinessKey: sql.Int,
+  cursor: sql.BigInt,
 
   // Quantities / money / decimals
   startOdometer: sql.Decimal(10, 2), endOdometer: sql.Decimal(10, 2),

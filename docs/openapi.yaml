@@ -1,0 +1,3310 @@
+openapi: 3.0.3
+info:
+  title: Renuzi Operations Platform API
+  version: 2.0.0
+  description: |
+    Fleet and warehouse field-operations API for the Renuzi Operations Platform
+    (Node.js + Express + SQL Server 2022, offline-first mobile clients).
+
+    ## Conventions
+
+    **Base URL:** all paths are relative to `/api` (e.g. `http://localhost:3000/api`).
+
+    **Response envelope** — every endpoint (except `GET /health`, `GET /ready` and
+    `GET /uploads/content/{token}`) responds with:
+
+    ```json
+    { "success": true, "message": "human-readable text", "data": {}, "count": 0 }
+    ```
+
+    `data` is the payload (object or array), `count` is the array length when `data`
+    is an array. Errors use `success: false` + `message`; in development an `error`
+    field (stack trace) is added — it never appears in production.
+
+    **Authentication** — `Authorization: Bearer <JWT>` on every endpoint except
+    `POST /auth/login`, `GET /health`, `GET /ready` and `GET /uploads/content/{token}`
+    (the HMAC token in that path is itself the credential). Tokens are issued by
+    login, signed with `JWT_SECRET`, default expiry 24h. The token is re-checked
+    against the database on every request, so deactivated users lose access
+    immediately. When the user's `must_change_password` flag is set, every
+    authenticated endpoint except `POST /auth/change-password` returns 403 with
+    machine-readable code `PASSWORD_ROTATION_REQUIRED`.
+
+    **Roles** — DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF,
+    OPS_MANAGER, SECURITY, ADMIN. Each operation lists its *effective* allowed
+    role set in the `x-roles` extension (the middleware widens nominal roles —
+    e.g. "driver" endpoints also allow FLEET_MANAGER and ADMIN; the documented
+    set is what the server actually enforces).
+
+    **Multi-tenancy** — every query is scoped by the business_key carried in the
+    JWT; no endpoint accepts a business key from the client.
+
+    **Rate limits** — global: 300 requests / 5 min / IP across /api; login:
+    10 attempts / 5 min / IP+userId pair. Exceeding either returns 429 with
+    draft-7 RateLimit-* headers.
+
+    **Offline sync contract** — offline writes are pushed via POST /sync/batch
+    (idempotent by clientRef) and downloads pulled via POST /pull (cursor-based
+    deltas with DELETE tombstones). Reconnect choreography: drain push queue,
+    probe GET /pull/meta, page POST /pull until hasMore=false, applying each page
+    with the version guard.
+
+    **Soft deletes** — rows are deactivated (is_active=0) and delivered downstream
+    as DELETE tombstones in the change log; clients drop the row.
+servers:
+  - url: 'http://localhost:3000/api'
+    description: Local development
+  - url: '{protocol}://{host}:{port}/api'
+    description: Configurable deployment (Docker / staging)
+    variables:
+      protocol:
+        enum: [http, https]
+        default: http
+      host:
+        default: localhost
+      port:
+        default: '3000'
+security:
+  - bearerAuth: []
+tags:
+  - name: Health
+    description: Liveness and readiness probes (no authentication).
+  - name: Auth
+    description: Login, registration, profile and password management.
+  - name: Fleet
+    description: Vehicles, checks, trips, fuel and maintenance (driver + fleet manager flows).
+  - name: Warehouse
+    description: GRNs, dispatches with custody chain, stock movements, counts, returns, stock position.
+  - name: Sync
+    description: Offline push queue - idempotent batch push, status, conflicts, requeue.
+  - name: Pull
+    description: Offline pull - change-log deltas and snapshots with cursor paging.
+  - name: Dashboard
+    description: Read-only, business-scoped aggregations for the ops web dashboard.
+  - name: Uploads
+    description: File upload with signed, time-limited retrieval URLs.
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: healthCheck
+      summary: Liveness probe (process up, no DB check)
+      security: []
+      x-roles: []
+      responses:
+        '200':
+          description: Process is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: OK }
+                  message: { type: string }
+                  timestamp: { type: string, format: date-time }
+                  version: { type: string, example: 2.0.0 }
+  /ready:
+    get:
+      tags: [Health]
+      operationId: readinessCheck
+      summary: Readiness probe (pings the database)
+      security: []
+      x-roles: []
+      responses:
+        '200':
+          description: Database reachable, service ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: READY }
+                  db: { type: string, example: connected }
+                  timestamp: { type: string, format: date-time }
+        '503':
+          description: Database unreachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: NOT_READY }
+                  db: { type: string, example: unreachable }
+                  timestamp: { type: string, format: date-time }
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Log in and obtain a JWT
+      description: |
+        Brute-force limited to 10 attempts / 5 min per IP+userId pair (429 when
+        exceeded). Unknown user and wrong password both return the same
+        401 "Invalid credentials" (no user enumeration, timing-equalised).
+      security: []
+      x-roles: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Login successful; JWT issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: Login successful }
+                  data: { $ref: '#/components/schemas/LoginData' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Account deactivated, business inactive, or driver license expired
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: registerUser
+      summary: Create a new user (admin only)
+      x-roles: [ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'User DRV-002 created successfully' }
+        '400':
+          description: Missing fields, invalid role, or businessKey not an active business
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: userId already exists
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /auth/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: Current user profile with business info
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      responses:
+        '200':
+          description: Profile (snake_case columns as stored)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { $ref: '#/components/schemas/UserProfile' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /auth/change-password:
+    post:
+      tags: [Auth]
+      operationId: changePassword
+      summary: Change own password
+      description: |
+        The only endpoint allowed while the must_change_password flag is set
+        (everything else returns 403 PASSWORD_ROTATION_REQUIRED). A successful
+        change clears the rotation flag.
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePasswordRequest' }
+      responses:
+        '200':
+          description: Password changed; rotation flag cleared
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Password changed successfully' }
+                  data:
+                    type: object
+                    properties:
+                      rotationCleared: { type: boolean, example: true }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing Authorization header, or currentPassword incorrect (an invalid/expired token returns 403)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/vehicles:
+    get:
+      tags: [Fleet]
+      operationId: listVehicles
+      summary: List all vehicles for the caller's business
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      responses:
+        '200':
+          description: Vehicles (ordered by vehicle_id)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Vehicle' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/vehicles/{vehicleKey}:
+    get:
+      tags: [Fleet]
+      operationId: getVehicle
+      summary: Vehicle detail
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      parameters:
+        - $ref: '#/components/parameters/VehicleKey'
+      responses:
+        '200':
+          description: Vehicle detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { $ref: '#/components/schemas/Vehicle' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/vehicles/{vehicleKey}/odometer:
+    put:
+      tags: [Fleet]
+      operationId: updateVehicleOdometer
+      summary: Update odometer reading (monotonicity enforced)
+      description: |
+        The new reading may never be below the vehicle's current odometer -
+        a regression returns 409. The update and its VEHICLES change-log row
+        commit in one transaction.
+      x-roles: [DRIVER, FLEET_MANAGER, ADMIN]
+      parameters:
+        - $ref: '#/components/parameters/VehicleKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OdometerUpdateRequest' }
+      responses:
+        '200':
+          description: Odometer updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Odometer updated' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Odometer reading below the vehicle's current odometer
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/checks:
+    post:
+      tags: [Fleet]
+      operationId: submitVehicleCheck
+      summary: Submit a vehicle daily check
+      description: |
+        The overall checkStatus is computed server-side: PASS when all 11
+        checklist items pass, PASS_WITH_ISSUES when any damage is reported,
+        FAIL otherwise. A client-supplied checkStatus is ignored.
+      x-roles: [DRIVER, FLEET_MANAGER, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VehicleCheckRequest' }
+      responses:
+        '201':
+          description: Check recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Vehicle check recorded' }
+                  data:
+                    type: object
+                    properties:
+                      checkKey: { type: integer }
+                      checkStatus: { $ref: '#/components/schemas/CheckStatus' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [Fleet]
+      operationId: listVehicleChecks
+      summary: List vehicle checks (fleet manager view)
+      x-roles: [FLEET_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: vehicleKey
+          in: query
+          description: Filter by vehicle
+          schema: { type: integer }
+        - name: status
+          in: query
+          description: Filter by check status
+          schema: { $ref: '#/components/schemas/CheckStatus' }
+        - name: dateFrom
+          in: query
+          description: 'check_datetime >= dateFrom'
+          schema: { type: string, format: date-time }
+        - name: dateTo
+          in: query
+          description: 'check_datetime <= dateTo'
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Checks (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/VehicleCheck' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/trips/start:
+    post:
+      tags: [Fleet]
+      operationId: startTrip
+      summary: Start a trip
+      description: |
+        Transactional: inserts the trip and flips the vehicle to ON_ROUTE.
+        409 when the start odometer is below the vehicle's current odometer or
+        the vehicle already has an active trip.
+      x-roles: [DRIVER, FLEET_MANAGER, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TripStartRequest' }
+      responses:
+        '201':
+          description: Trip started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Trip started' }
+                  data:
+                    type: object
+                    properties:
+                      tripKey: { type: integer }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Odometer regression or active-trip collision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/trips/{tripKey}/end:
+    post:
+      tags: [Fleet]
+      operationId: endTrip
+      summary: End a trip
+      description: |
+        Idempotent: ending an already-COMPLETED or CANCELLED trip is a no-op
+        ack (alreadyEnded true). Distance is computed as endOdometer minus
+        start_odometer; the vehicle returns to ACTIVE (guarded odometer
+        update) and both updates commit transactionally.
+      x-roles: [DRIVER, FLEET_MANAGER, ADMIN]
+      parameters:
+        - name: tripKey
+          in: path
+          required: true
+          description: Numeric key of the trip (fact_trip.trip_key)
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TripEndRequest' }
+      responses:
+        '200':
+          description: Trip completed (or already-ended ack)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Trip completed' }
+                  data:
+                    type: object
+                    properties:
+                      tripKey: { type: integer }
+                      distanceKm: { type: number, nullable: true }
+                      alreadyEnded: { type: boolean, example: false }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: endOdometer below the trip's start odometer
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/trips:
+    get:
+      tags: [Fleet]
+      operationId: listTrips
+      summary: List trips
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      parameters:
+        - name: vehicleKey
+          in: query
+          schema: { type: integer }
+        - name: driverKey
+          in: query
+          schema: { type: integer }
+        - name: status
+          in: query
+          description: Trip status filter
+          schema: { $ref: '#/components/schemas/TripStatus' }
+        - name: dateFrom
+          in: query
+          description: 'trip_start_time >= dateFrom'
+          schema: { type: string, format: date-time }
+        - name: dateTo
+          in: query
+          description: 'trip_start_time <= dateTo'
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Trips (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Trip' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/fuel-requests:
+    post:
+      tags: [Fleet]
+      operationId: createFuelRequest
+      summary: Request fuel (driver)
+      x-roles: [DRIVER, FLEET_MANAGER, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FuelRequestCreateRequest' }
+      responses:
+        '201':
+          description: Fuel request submitted (status PENDING)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Fuel request submitted' }
+                  data:
+                    type: object
+                    properties:
+                      fuelRequestKey: { type: integer }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [Fleet]
+      operationId: listFuelRequests
+      summary: List fuel requests (fleet manager view)
+      x-roles: [FLEET_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: status
+          in: query
+          description: Approval status filter
+          schema: { $ref: '#/components/schemas/FuelRequestStatus' }
+        - name: vehicleKey
+          in: query
+          schema: { type: integer }
+        - name: dateFrom
+          in: query
+          description: 'request_datetime >= dateFrom'
+          schema: { type: string, format: date-time }
+        - name: dateTo
+          in: query
+          description: 'request_datetime <= dateTo'
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Fuel requests (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/FuelRequest' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/fuel-requests/{fuelRequestKey}/approve:
+    put:
+      tags: [Fleet]
+      operationId: decideFuelRequest
+      summary: Approve or reject a fuel request
+      description: Only PENDING requests can be decided; a second decision returns 409.
+      x-roles: [FLEET_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: fuelRequestKey
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FuelApproveRequest' }
+      responses:
+        '200':
+          description: Decision recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Fuel request approved' }
+        '400':
+          description: approvalStatus must be APPROVED or REJECTED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Fuel request already decided
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/fuel-logs:
+    post:
+      tags: [Fleet]
+      operationId: recordFuelLog
+      summary: Log an actual refuelling (driver)
+      description: |
+        409 when the odometer reading is below the vehicle's current odometer.
+        kmSinceLast and litersPer100km are computed server-side; the vehicle
+        odometer is advanced (guarded) in the same transaction.
+      x-roles: [DRIVER, FLEET_MANAGER, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FuelLogRequest' }
+      responses:
+        '201':
+          description: Fuel log recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Fuel log recorded' }
+                  data:
+                    type: object
+                    properties:
+                      fuelLogKey: { type: integer }
+                      kmSinceLast: { type: number, nullable: true }
+                      litersPer100km: { type: number, nullable: true }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Odometer regression
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/maintenance:
+    post:
+      tags: [Fleet]
+      operationId: reportMaintenance
+      summary: Raise a maintenance ticket
+      description: |
+        When estimatedCost exceeds the MAINTENANCE_MD_THRESHOLD app config
+        (default 100000), the ticket enters PENDING and needs OPS then MD
+        approval; otherwise it is born OPS_APPROVED.
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MaintenanceCreateRequest' }
+      responses:
+        '201':
+          description: Ticket created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Maintenance ticket created (requires MD approval)' }
+                  data:
+                    type: object
+                    properties:
+                      maintenanceKey: { type: integer }
+                      needsMdApproval: { type: boolean }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [Fleet]
+      operationId: listMaintenanceTickets
+      summary: List maintenance tickets
+      x-roles: [FLEET_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: status
+          in: query
+          description: Maintenance status filter
+          schema: { $ref: '#/components/schemas/MaintenanceStatus' }
+        - name: vehicleKey
+          in: query
+          schema: { type: integer }
+        - name: priority
+          in: query
+          schema: { $ref: '#/components/schemas/Priority' }
+      responses:
+        '200':
+          description: Tickets (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Maintenance' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/maintenance/{maintenanceKey}/approve:
+    put:
+      tags: [Fleet]
+      operationId: approveMaintenance
+      summary: Approve a maintenance ticket (OPS or MD level)
+      description: |
+        Two-level approval. OPS approves from PENDING (ticket becomes
+        OPS_APPROVED when above the MD threshold, MD_APPROVED otherwise).
+        MD approves from OPS_APPROVED but only when the ticket is above the
+        threshold. Ordering violations return 409.
+      x-roles: [FLEET_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: maintenanceKey
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approvalLevel]
+              properties:
+                approvalLevel:
+                  type: string
+                  enum: [OPS, MD]
+      responses:
+        '200':
+          description: Approval recorded (message states whether MD approval is still required)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string }
+        '400':
+          description: approvalLevel must be OPS or MD
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Already decided, MD without prior OPS approval, or ticket within OPS threshold
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/maintenance/{maintenanceKey}/status:
+    put:
+      tags: [Fleet]
+      operationId: updateMaintenanceStatus
+      summary: Update maintenance workflow status
+      description: |
+        Work can only progress to IN_PROGRESS or COMPLETED once the ticket is
+        at least OPS_APPROVED (409 otherwise). Setting IN_PROGRESS/COMPLETED
+        stamps work_start_date/work_completion_date automatically.
+      x-roles: [FLEET_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: maintenanceKey
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MaintenanceStatusRequest' }
+      responses:
+        '200':
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Maintenance marked COMPLETED' }
+        '400':
+          description: Invalid maintenanceStatus
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Ticket must be approved before work can progress
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /fleet/routes:
+    get:
+      tags: [Fleet]
+      operationId: listRoutes
+      summary: List delivery routes
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      responses:
+        '200':
+          description: Routes with assigned vehicle/driver info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Route' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/grn:
+    post:
+      tags: [Warehouse]
+      operationId: createGrn
+      summary: Create a Goods Receipt Note (header + lines, transactional)
+      description: |
+        GRN number (GRN-BUSINESS-YYYYMMDD-SEQ) is generated server-side.
+        receiptStatus is derived from the totals (REJECTED when nothing
+        received and rejections exist, PARTIAL when received+rejected is less
+        than invoiced, COMPLETE otherwise). Positive receipts become RECEIPT
+        stock movements so stock position stays correct.
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GrnCreateRequest' }
+      responses:
+        '201':
+          description: GRN recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'GRN GRN-KETU-20260910-001 recorded' }
+                  data:
+                    type: object
+                    properties:
+                      grnKey: { type: integer }
+                      grnNumber: { type: string }
+                      receiptStatus: { $ref: '#/components/schemas/ReceiptStatus' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [Warehouse]
+      operationId: listGrns
+      summary: List GRNs
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: status
+          in: query
+          description: Receipt status filter
+          schema: { $ref: '#/components/schemas/ReceiptStatus' }
+        - name: dateFrom
+          in: query
+          description: 'created_at >= dateFrom'
+          schema: { type: string, format: date-time }
+        - name: dateTo
+          in: query
+          description: 'created_at <= dateTo'
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: GRNs (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Grn' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/grn/{grnKey}:
+    get:
+      tags: [Warehouse]
+      operationId: getGrn
+      summary: GRN detail with lines
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: grnKey
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: GRN header plus lines array
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    allOf:
+                      - $ref: '#/components/schemas/Grn'
+                      - type: object
+                        properties:
+                          lines:
+                            type: array
+                            items: { $ref: '#/components/schemas/GrnLine' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/grn/{grnKey}/finance-signoff:
+    put:
+      tags: [Warehouse]
+      operationId: grnFinanceSignoff
+      summary: Finance sign-off on a GRN (one-shot)
+      description: Signing off an already-signed GRN returns 409.
+      x-roles: [OPS_MANAGER, ADMIN, FLEET_MANAGER, WAREHOUSE_MANAGER]
+      parameters:
+        - name: grnKey
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                creditNoteIssued:
+                  type: boolean
+                  description: Whether a credit note was issued for short/rejected deliveries
+                creditNoteNumber: { type: string }
+      responses:
+        '200':
+          description: Sign-off recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Finance signoff recorded' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: GRN already signed off by finance
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/dispatch:
+    post:
+      tags: [Warehouse]
+      operationId: createDispatch
+      summary: Create a dispatch (header + lines, transactional)
+      description: |
+        Dispatch number (DSP-BUSINESS-YYYYMMDD-SEQ) generated server-side;
+        initial status PENDING. line_total is computed as unitPrice x
+        pickedQty when both are supplied.
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DispatchCreateRequest' }
+      responses:
+        '201':
+          description: Dispatch created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Dispatch DSP-KETU-20260910-001 created' }
+                  data:
+                    type: object
+                    properties:
+                      dispatchKey: { type: integer }
+                      dispatchNumber: { type: string }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [Warehouse]
+      operationId: listDispatches
+      summary: List dispatches
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: status
+          in: query
+          description: Dispatch status filter
+          schema: { $ref: '#/components/schemas/DispatchStatus' }
+        - name: customerKey
+          in: query
+          schema: { type: integer }
+        - name: dateFrom
+          in: query
+          description: 'created_at >= dateFrom'
+          schema: { type: string, format: date-time }
+        - name: dateTo
+          in: query
+          description: 'created_at <= dateTo'
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Dispatches (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Dispatch' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/dispatch/{dispatchKey}:
+    get:
+      tags: [Warehouse]
+      operationId: getDispatch
+      summary: Dispatch detail with lines
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: dispatchKey
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Dispatch header plus lines array
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    allOf:
+                      - $ref: '#/components/schemas/Dispatch'
+                      - type: object
+                        properties:
+                          lines:
+                            type: array
+                            items: { $ref: '#/components/schemas/DispatchLine' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/dispatch/{dispatchKey}/warehouse-stamp:
+    put:
+      tags: [Warehouse]
+      operationId: stampWarehouseCustody
+      summary: Warehouse custody stamp (first stage of the custody chain)
+      description: |
+        Custody chain WAREHOUSE -> SECURITY -> DRIVER -> CUSTOMER, each stage
+        requiring the previous one (409 otherwise). Every stage is idempotent
+        - re-stamping acks rather than errors. The warehouse stamp moves
+        PENDING dispatches to LOADED and can record per-line loaded quantities.
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: dispatchKey
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                loadedQuantities:
+                  type: array
+                  description: Optional per-line loaded quantity overrides
+                  items:
+                    type: object
+                    required: [lineKey, loadedQty]
+                    properties:
+                      lineKey:
+                        type: integer
+                        description: fact_dispatch_line.dispatch_line_key
+                      loadedQty: { type: integer }
+      responses:
+        '200':
+          description: Warehouse stamp applied (status LOADED)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Warehouse stamp applied' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/dispatch/{dispatchKey}/security-stamp:
+    put:
+      tags: [Warehouse]
+      operationId: stampSecurityCustody
+      summary: Security custody stamp (requires warehouse stamp)
+      x-roles: [SECURITY, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: dispatchKey
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Security stamp applied (status LOADED)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Security stamp applied' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/dispatch/{dispatchKey}/driver-ack:
+    put:
+      tags: [Warehouse]
+      operationId: driverAckDispatch
+      summary: Driver acknowledgement (requires security stamp; sets IN_TRANSIT)
+      description: |
+        Only the assigned driver or a FLEET_MANAGER / OPS_MANAGER / ADMIN may
+        acknowledge (403 otherwise).
+      x-roles: [DRIVER, FLEET_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: dispatchKey
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                driverSignatureUrl:
+                  type: string
+                  description: Signed URL from POST /uploads (purpose DRIVER_SIGNATURE)
+      responses:
+        '200':
+          description: Driver acknowledgement recorded (status IN_TRANSIT)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Driver acknowledgement recorded' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller is neither the assigned driver nor a manager
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/dispatch/{dispatchKey}/customer-ack:
+    put:
+      tags: [Warehouse]
+      operationId: customerAckDispatch
+      summary: Customer acknowledgement / delivery confirmation (requires driver ack)
+      description: |
+        Final stage: sets DELIVERED (or RETURNED when returned is true),
+        records per-line delivered/returned quantities, and writes DISPATCH /
+        TRANSFER_IN stock movements in one transaction. Only the assigned
+        driver or a FLEET_MANAGER / OPS_MANAGER / WAREHOUSE_MANAGER / ADMIN
+        may confirm (403 otherwise).
+      x-roles: [DRIVER, FLEET_MANAGER, OPS_MANAGER, WAREHOUSE_MANAGER, ADMIN]
+      parameters:
+        - name: dispatchKey
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CustomerAckRequest' }
+      responses:
+        '200':
+          description: Dispatch marked DELIVERED (or RETURNED)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Dispatch marked DELIVERED' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller is neither the assigned driver nor a manager
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/movements:
+    get:
+      tags: [Warehouse]
+      operationId: listStockMovements
+      summary: Stock movement ledger
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: productKey
+          in: query
+          schema: { type: integer }
+        - name: movementType
+          in: query
+          schema: { $ref: '#/components/schemas/MovementType' }
+        - name: location
+          in: query
+          description: warehouse_location filter
+          schema: { type: string }
+        - name: dateFrom
+          in: query
+          description: 'created_at >= dateFrom'
+          schema: { type: string, format: date-time }
+        - name: dateTo
+          in: query
+          description: 'created_at <= dateTo'
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Movements (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/StockMovement' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [Warehouse]
+      operationId: createStockMovement
+      summary: Manual adjustment / transfer / damage / expiry movement
+      description: |
+        Only manual movement types are accepted (RECEIPT, DISPATCH and COUNT
+        are system-generated). TRANSFER_OUT additionally requires toBusinessKey.
+      x-roles: [WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ManualMovementRequest' }
+      responses:
+        '201':
+          description: Movement recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Stock movement recorded' }
+                  data:
+                    type: object
+                    properties:
+                      movementKey: { type: integer }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/counts:
+    post:
+      tags: [Warehouse]
+      operationId: createStockCount
+      summary: Record a stock count (variance computed server-side)
+      description: Variance is always physicalCount minus systemQty, computed server-side.
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StockCountRequest' }
+      responses:
+        '201':
+          description: Count recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Stock count recorded' }
+                  data:
+                    type: object
+                    properties:
+                      countKey: { type: integer }
+                      variance: { type: integer }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [Warehouse]
+      operationId: listStockCounts
+      summary: List stock counts (variances highlighted)
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: onlyVariances
+          in: query
+          description: When true or 1, only rows with variance != 0
+          schema: { type: string, enum: ['true', '1', 'false'] }
+        - name: dateFrom
+          in: query
+          description: 'created_at >= dateFrom'
+          schema: { type: string, format: date-time }
+        - name: dateTo
+          in: query
+          description: 'created_at <= dateTo'
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Counts (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/StockCount' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/returns:
+    post:
+      tags: [Warehouse]
+      operationId: createGoodsReturn
+      summary: Record a goods return (header + TRANSFER_IN movement, transactional)
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GoodsReturnRequest' }
+      responses:
+        '201':
+          description: Return recorded (status PENDING; goods re-enter stock)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Goods return recorded' }
+                  data:
+                    type: object
+                    properties:
+                      returnKey: { type: integer }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    get:
+      tags: [Warehouse]
+      operationId: listGoodsReturns
+      summary: List goods returns
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: status
+          in: query
+          description: Return status filter
+          schema: { $ref: '#/components/schemas/ReturnStatus' }
+        - name: dateFrom
+          in: query
+          description: 'created_at >= dateFrom'
+          schema: { type: string, format: date-time }
+        - name: dateTo
+          in: query
+          description: 'created_at <= dateTo'
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Returns (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/GoodsReturn' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warehouse/stock-position:
+    get:
+      tags: [Warehouse]
+      operationId: getStockPosition
+      summary: Current stock by SKU / warehouse location
+      x-roles: [WAREHOUSE_STAFF, WAREHOUSE_MANAGER, OPS_MANAGER, ADMIN]
+      parameters:
+        - name: skuCode
+          in: query
+          description: Substring match on sku_code (LIKE %...%)
+          schema: { type: string }
+        - name: category
+          in: query
+          schema: { type: string }
+        - name: location
+          in: query
+          description: warehouse_location filter
+          schema: { type: string }
+      responses:
+        '200':
+          description: Stock position rows (ordered by product_name)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/StockPositionRow' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sync/batch:
+    post:
+      tags: [Sync]
+      operationId: pushSyncBatch
+      summary: Push a batch of queued offline payloads (idempotent)
+      description: |
+        Each item is idempotent per clientRef - retrying the same batch re-acks
+        instead of double-inserting (unique index on
+        device+user+entityType+clientRef). Per-item statuses: QUEUED,
+        DUPLICATE_ACK (already synced), ALREADY_QUEUED (still queued), or
+        REJECTED (shape/entityType problem). Batch size is capped by the
+        SYNC_BATCH_SIZE app config (default 50). The queue is processed
+        immediately after acceptance (best-effort; cron also drains it every
+        minute). Failed rows retry with jittered exponential backoff
+        (base 30s x 2^retryCount, max 5 retries) then dead-letter.
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SyncBatchRequest' }
+      responses:
+        '200':
+          description: Batch accepted with per-item results and a processing summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Batch received: 3 queued, 3 processed' }
+                  data:
+                    type: object
+                    properties:
+                      results:
+                        type: array
+                        items: { $ref: '#/components/schemas/SyncItemResult' }
+                      processing: { $ref: '#/components/schemas/ProcessingSummary' }
+        '400':
+          description: Missing deviceId / empty items, or batch larger than SYNC_BATCH_SIZE
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sync/status:
+    get:
+      tags: [Sync]
+      operationId: getSyncStatus
+      summary: Per-device queue status
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      parameters:
+        - name: deviceId
+          in: query
+          description: Optional device filter (omitted = all devices of the business)
+          schema: { type: string }
+      responses:
+        '200':
+          description: Queue rows grouped by device (most recent activity first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/QueueStatusRow' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sync/process:
+    post:
+      tags: [Sync]
+      operationId: processSyncQueue
+      summary: Manually drain the sync queue
+      description: Admin/test escape hatch - the cron scheduler drains every minute regardless.
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      responses:
+        '200':
+          description: Processing summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Processed 12 items' }
+                  data: { $ref: '#/components/schemas/ProcessingSummary' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sync/conflicts:
+    get:
+      tags: [Sync]
+      operationId: listSyncConflicts
+      summary: Unresolved sync conflicts (both versions exposed)
+      description: |
+        Each row carries BOTH the server version and the client version so the
+        mobile app / web UI can render a reconciliation screen.
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      responses:
+        '200':
+          description: Pending conflicts (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ConflictRow' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sync/conflicts/{conflictKey}/resolve:
+    put:
+      tags: [Sync]
+      operationId: resolveSyncConflict
+      summary: Resolve a conflict and re-apply the winner
+      description: |
+        SERVER_WINS keeps the server state (client payload discarded);
+        CLIENT_WINS re-applies the parked client payload through the same
+        processor with guards overridden; MERGED applies the client payload
+        overlaid with mergedPayload (required for MERGED). A merge that still
+        violates a hard invariant is rejected with 409.
+      x-roles: [OPS_MANAGER, ADMIN, FLEET_MANAGER, WAREHOUSE_MANAGER]
+      parameters:
+        - name: conflictKey
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConflictResolveRequest' }
+      responses:
+        '200':
+          description: Resolution applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string }
+                  data:
+                    type: object
+                    properties:
+                      conflictKey: { type: integer }
+                      resolution: { $ref: '#/components/schemas/ConflictResolution' }
+                      applied:
+                        type: string
+                        enum: [SERVER_KEPT, CLIENT_APPLIED, MERGE_APPLIED]
+                      entityKey: { type: integer, nullable: true }
+        '400':
+          description: Invalid resolution, or mergedPayload missing for MERGED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Conflict already resolved, or the resolved version still violates a hard invariant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sync/queue/{queueId}/requeue:
+    post:
+      tags: [Sync]
+      operationId: requeueSyncRow
+      summary: Reset a FAILED / DEAD_LETTER queue row to PENDING
+      description: Admin escape hatch after the underlying failure cause was fixed.
+      x-roles: [OPS_MANAGER, ADMIN, FLEET_MANAGER, WAREHOUSE_MANAGER]
+      parameters:
+        - name: queueId
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Row reset to PENDING with retry budget restored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'Queue row reset to PENDING' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No retryable row found for that queueId
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /pull/meta:
+    get:
+      tags: [Pull]
+      operationId: getPullMeta
+      summary: Cheap "is anything pending" probe per dataset
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      parameters:
+        - name: datasets
+          in: query
+          description: Comma-separated dataset list (default = all pull datasets; unknown names are silently ignored)
+          schema: { type: string, example: 'VEHICLES,ROUTES' }
+      responses:
+        '200':
+          description: Map of dataset name to maxChangeKey/totalChanges
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        maxChangeKey: { type: integer }
+                        totalChanges: { type: integer }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /pull:
+    post:
+      tags: [Pull]
+      operationId: pullChanges
+      summary: Paged delta pull (cursor-based, resumable)
+      description: |
+        Per-dataset cursor: { DATASET: lastAppliedChangeKey }. Cursor 0 (or
+        absent) means full snapshot of current state, keyset-paged - while a
+        snapshot has more pages the response carries snapshotAfterKey (last
+        entityKey of the page); echo it back unchanged on the next call with
+        the cursor still 0 to resume. Deletes arrive as DELETE tombstones
+        with payload null - clients drop the row. Stale cursors (older than
+        the retention sweep) return resetRequired listing the datasets to
+        re-bootstrap with cursor 0. hasMore true means another page is
+        pending for at least one dataset.
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PullRequest' }
+      responses:
+        '200':
+          description: One page of changes plus continuation cursors
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string }
+                  data:
+                    type: object
+                    properties:
+                      changes:
+                        type: array
+                        items: { $ref: '#/components/schemas/ChangeRow' }
+                      nextCursor:
+                        type: object
+                        description: Map of dataset to its new watermark
+                        additionalProperties: { type: integer }
+                      hasMore: { type: boolean }
+                      snapshotAfterKey:
+                        type: object
+                        description: Present while a cursor-0 snapshot still has pages
+                        additionalProperties: { type: integer }
+                      resetRequired:
+                        type: array
+                        description: Datasets whose cursor went stale (re-bootstrap with cursor 0)
+                        items: { type: string }
+        '400':
+          description: cursor/snapshotAfterKey not an object, unknown dataset, or negative key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /dashboard/fleet-daily:
+    get:
+      tags: [Dashboard]
+      operationId: getFleetDailyDashboard
+      summary: Trips and checks summary for a date
+      description: dateKey defaults to today in Africa/Lagos time.
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      parameters:
+        - name: dateKey
+          in: query
+          description: YYYYMMDD or YYYY-MM-DD (defaults to today, Africa/Lagos)
+          schema: { type: string, example: '20260910' }
+      responses:
+        '200':
+          description: Daily fleet summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      dateKey: { type: integer, example: 20260910 }
+                      trips:
+                        type: object
+                        properties:
+                          total_trips: { type: integer, nullable: true }
+                          completed_trips: { type: integer, nullable: true }
+                          active_trips: { type: integer, nullable: true }
+                          cancelled_trips: { type: integer, nullable: true }
+                          total_distance_km: { type: number, nullable: true }
+                          stores_visited: { type: integer, nullable: true }
+                          deliveries_ok: { type: integer, nullable: true }
+                          deliveries_failed: { type: integer, nullable: true }
+                      checks:
+                        type: object
+                        properties:
+                          total_checks: { type: integer, nullable: true }
+                          passed: { type: integer, nullable: true }
+                          failed: { type: integer, nullable: true }
+                          pass_with_issues: { type: integer, nullable: true }
+                          damage_reports: { type: integer, nullable: true }
+        '400':
+          description: dateKey not YYYYMMDD / YYYY-MM-DD
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /dashboard/fuel-efficiency:
+    get:
+      tags: [Dashboard]
+      operationId: getFuelEfficiencyDashboard
+      summary: Fuel metrics per vehicle
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      parameters:
+        - name: dateFrom
+          in: query
+          description: 'refuel_datetime >= dateFrom'
+          schema: { type: string, format: date-time }
+        - name: dateTo
+          in: query
+          description: 'refuel_datetime <= dateTo'
+          schema: { type: string, format: date-time }
+        - name: dateKeyFrom
+          in: query
+          description: YYYYMMDD lower bound on date_key
+          schema: { type: string, example: '20260901' }
+        - name: dateKeyTo
+          in: query
+          description: YYYYMMDD upper bound on date_key
+          schema: { type: string, example: '20260930' }
+      responses:
+        '200':
+          description: Per-vehicle fuel aggregates
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        vehicle_id: { type: string, example: VAN-001 }
+                        plate_number: { type: string }
+                        refuel_events: { type: integer, nullable: true }
+                        total_liters: { type: number, nullable: true }
+                        total_cost: { type: number, nullable: true }
+                        total_km: { type: number, nullable: true }
+                        avg_liters_per_100km: { type: number, nullable: true }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /dashboard/maintenance-queue:
+    get:
+      tags: [Dashboard]
+      operationId: getMaintenanceQueueDashboard
+      summary: Open/pending maintenance tickets (priority-ordered queue)
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      responses:
+        '200':
+          description: Maintenance summary plus open ticket queue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      summary:
+                        type: object
+                        properties:
+                          open_tickets: { type: integer, nullable: true }
+                          in_progress: { type: integer, nullable: true }
+                          completed: { type: integer, nullable: true }
+                          awaiting_ops_approval: { type: integer, nullable: true }
+                          awaiting_md_approval: { type: integer, nullable: true }
+                          total_estimated_cost: { type: number, nullable: true }
+                          total_actual_cost: { type: number, nullable: true }
+                      queue:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            maintenance_key: { type: integer }
+                            maintenance_type: { type: string }
+                            priority: { type: string }
+                            description: { type: string }
+                            estimated_cost: { type: number, nullable: true }
+                            approval_status: { type: string }
+                            maintenance_status: { type: string }
+                            created_at: { type: string, format: date-time }
+                            vehicle_id: { type: string }
+                            plate_number: { type: string }
+                            reported_by_name: { type: string }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /dashboard/stock-position:
+    get:
+      tags: [Dashboard]
+      operationId: getStockPositionDashboard
+      summary: Current stock by SKU (dashboard view)
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      parameters:
+        - name: lowStockOnly
+          in: query
+          description: When true or 1, only rows with current_stock <= 10
+          schema: { type: string, enum: ['true', '1', 'false'] }
+      responses:
+        '200':
+          description: Stock position rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  count: { type: integer }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/StockPositionRow' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /dashboard/dispatch-performance:
+    get:
+      tags: [Dashboard]
+      operationId: getDispatchPerformanceDashboard
+      summary: Delivery KPIs
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      parameters:
+        - name: dateKey
+          in: query
+          description: YYYYMMDD or YYYY-MM-DD single-day filter
+          schema: { type: string, example: '20260910' }
+        - name: dateFrom
+          in: query
+          description: 'created_at >= dateFrom'
+          schema: { type: string, format: date-time }
+        - name: dateTo
+          in: query
+          description: 'created_at <= dateTo'
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Dispatch summary plus counts by status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      summary:
+                        type: object
+                        properties:
+                          total_dispatches: { type: integer, nullable: true }
+                          delivered: { type: integer, nullable: true }
+                          in_transit: { type: integer, nullable: true }
+                          pending: { type: integer, nullable: true }
+                          returned: { type: integer, nullable: true }
+                          avg_hours_to_deliver: { type: number, nullable: true }
+                      byStatus:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            dispatch_status: { type: string }
+                            count: { type: integer }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /dashboard/variances:
+    get:
+      tags: [Dashboard]
+      operationId: getVariancesDashboard
+      summary: Stock count variances and open investigations
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      responses:
+        '200':
+          description: Variance summary plus unresolved investigations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      summary:
+                        type: object
+                        properties:
+                          total_counts: { type: integer, nullable: true }
+                          counts_with_variance: { type: integer, nullable: true }
+                          surpluses: { type: integer, nullable: true }
+                          shortfalls: { type: integer, nullable: true }
+                          total_units_short: { type: integer, nullable: true }
+                          total_units_over: { type: integer, nullable: true }
+                      open:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            count_key: { type: integer }
+                            system_qty: { type: integer }
+                            physical_count: { type: integer }
+                            variance: { type: integer, nullable: true }
+                            variance_reason: { type: string, nullable: true }
+                            investigation_status: { type: string }
+                            manager_decision: { type: string, nullable: true }
+                            created_at: { type: string, format: date-time }
+                            sku_code: { type: string }
+                            product_name: { type: string }
+                            counted_by_name: { type: string }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /uploads:
+    post:
+      tags: [Uploads]
+      operationId: uploadFile
+      summary: Upload a file and receive a signed, time-limited URL
+      description: |
+        multipart/form-data with field file. Defense in depth: MIME whitelist
+        + magic-byte sniffing (extension lies are caught, 415), 10 MB cap
+        (413), optional ClamAV scan (fails closed - a configured but
+        unreachable scanner rejects the upload with 503; a detected virus
+        returns 422). The returned url is the value stored in damage_photo_url
+        / receipt_photo_url / signature fields; clients re-fetch via
+        GET /uploads/content/{token} when it expires (default TTL 900s).
+      x-roles: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+      parameters:
+        - name: purpose
+          in: query
+          required: false
+          description: Defaults to GENERAL
+          schema: { $ref: '#/components/schemas/UploadPurpose' }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: jpeg / png / webp / pdf, max 10 MB
+      responses:
+        '201':
+          description: File stored; signed URL issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string, example: 'File stored' }
+                  data: { $ref: '#/components/schemas/UploadStored' }
+        '400':
+          description: Empty file or invalid purpose
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          description: Content does not match any allowed type (magic-byte check)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422':
+          description: File failed virus scanning
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          description: Virus scanning temporarily unavailable (fails closed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /uploads/content/{token}:
+    get:
+      tags: [Uploads]
+      operationId: downloadUploadContent
+      summary: Stream a stored file via its signed token
+      description: |
+        No Authorization header - the HMAC-SHA256 token in the path is itself
+        the credential (lets mobile webviews and native photo viewers fetch
+        without header injection). 404 when expired or invalid. Responses
+        carry Cache-Control private max-age=300 and Content-Disposition inline.
+      security: []
+      x-roles: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: Signed token from the upload response url
+          schema: { type: string }
+      responses:
+        '200':
+          description: File bytes (Content-Type matches the sniffed type)
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+            image/png:
+              schema: { type: string, format: binary }
+            image/webp:
+              schema: { type: string, format: binary }
+            application/pdf:
+              schema: { type: string, format: binary }
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '404':
+          description: Link expired or invalid, or file missing
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT issued by POST /auth/login (default expiry 24h). Send as
+        Authorization Bearer token. Re-validated against the database on every
+        request; deactivated users are rejected immediately.
+  parameters:
+    VehicleKey:
+      name: vehicleKey
+      in: path
+      required: true
+      description: Numeric key of the vehicle (dim_vehicle.vehicle_key)
+      schema: { type: integer }
+  responses:
+    BadRequest:
+      description: Validation failure (message names the field)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unauthorized:
+      description: Missing Authorization header (or bad credentials on login). Invalid or expired tokens return 403, not 401.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Forbidden:
+      description: Wrong role, invalid/expired token, deactivated account, or PASSWORD_ROTATION_REQUIRED (see code)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound:
+      description: Resource not found (or endpoint)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Conflict:
+      description: State conflict (duplicate decision, broken custody chain, odometer regression)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    PayloadTooLarge:
+      description: Upload or JSON body too large (10 MB caps)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    RateLimited:
+      description: Too many requests (global 300/5min/IP or login 10/5min/IP+userId)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    InternalError:
+      description: Generic internal error - no stack/message leaks in production
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        message: { type: string }
+        code:
+          type: string
+          description: Machine-readable code, e.g. PASSWORD_ROTATION_REQUIRED
+        error:
+          type: string
+          description: Stack trace - DEVELOPMENT ONLY, never in production
+    LoginRequest:
+      type: object
+      required: [userId, password]
+      properties:
+        userId: { type: string, example: DRV-001 }
+        password: { type: string, format: password }
+        deviceId: { type: string, description: Optional mobile device identifier for logging }
+    LoginData:
+      type: object
+      properties:
+        token: { type: string, description: JWT bearer token (24h default expiry) }
+        user:
+          type: object
+          properties:
+            userKey: { type: integer }
+            userId: { type: string, example: DRV-001 }
+            fullName: { type: string }
+            email: { type: string, nullable: true }
+            role: { $ref: '#/components/schemas/UserRole' }
+            department: { type: string }
+            businessKey: { type: integer }
+            businessName: { type: string }
+            businessId: { type: string, example: KD-KETU }
+            licenseWarning: { type: string, nullable: true, description: Populated for drivers with <= 30 days to license expiry }
+            mustChangePassword: { type: boolean }
+    RegisterRequest:
+      type: object
+      required: [userId, fullName, role, department, businessKey, password]
+      properties:
+        userId: { type: string, example: DRV-002 }
+        fullName: { type: string }
+        email: { type: string }
+        phone: { type: string }
+        role: { $ref: '#/components/schemas/UserRole' }
+        department:
+          type: string
+          enum: [FLEET, WAREHOUSE, OPERATIONS, FINANCE]
+        businessKey: { type: integer, description: Must reference an active business }
+        password: { type: string, format: password }
+        licenseNumber: { type: string, description: Drivers only }
+        licenseExpiry: { type: string, format: date, description: Drivers only }
+    UserProfile:
+      type: object
+      description: Snake_case columns as returned by the database
+      properties:
+        user_key: { type: integer }
+        user_id: { type: string }
+        full_name: { type: string }
+        email: { type: string, nullable: true }
+        phone: { type: string, nullable: true }
+        role: { $ref: '#/components/schemas/UserRole' }
+        department: { type: string }
+        license_number: { type: string, nullable: true }
+        license_expiry: { type: string, format: date, nullable: true }
+        created_at: { type: string, format: date-time }
+        business_name: { type: string }
+        business_id: { type: string }
+        region: { type: string, nullable: true }
+    ChangePasswordRequest:
+      type: object
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword: { type: string, format: password }
+        newPassword:
+          type: string
+          format: password
+          minLength: 6
+    OdometerUpdateRequest:
+      type: object
+      required: [odometerReading]
+      properties:
+        odometerReading:
+          type: number
+          minimum: 0
+          description: Must be >= the vehicle's current reading (409 otherwise)
+    VehicleCheckRequest:
+      type: object
+      required: [vehicleKey]
+      properties:
+        vehicleKey: { type: integer }
+        mobileDeviceId: { type: string }
+        latitude: { type: number }
+        longitude: { type: number }
+        tiresOk: { type: boolean }
+        lightsOk: { type: boolean }
+        brakesOk: { type: boolean }
+        engineOk: { type: boolean }
+        oilLevelOk: { type: boolean }
+        coolantOk: { type: boolean }
+        wipersOk: { type: boolean }
+        mirrorsOk: { type: boolean }
+        seatbeltsOk: { type: boolean }
+        fireExtinguisherOk: { type: boolean }
+        firstAidKitOk: { type: boolean }
+        hasDamage: { type: boolean, description: Forces PASS_WITH_ISSUES when true }
+        damageDescription: { type: string }
+        damagePhotoUrl: { type: string, description: Signed URL from POST /uploads (purpose DAMAGE_PHOTO) }
+        checkTime: { type: string, format: date-time, description: Reserved; server stamps GETDATE() }
+    TripStartRequest:
+      type: object
+      required: [vehicleKey, startOdometer]
+      properties:
+        vehicleKey: { type: integer }
+        routeKey: { type: integer }
+        startTime: { type: string, format: date-time, description: Defaults to now }
+        startOdometer: { type: number, description: Must be >= vehicle's current odometer }
+        latitude: { type: number }
+        longitude: { type: number }
+        driverNotes: { type: string }
+        mobileDeviceId: { type: string }
+    TripEndRequest:
+      type: object
+      required: [endOdometer]
+      properties:
+        endOdometer: { type: number, description: Must be >= the trip's start odometer }
+        endTime: { type: string, format: date-time, description: Defaults to now }
+        latitude: { type: number }
+        longitude: { type: number }
+        storesVisited: { type: integer }
+        deliverySuccessCount: { type: integer }
+        deliveryFailCount: { type: integer }
+        driverNotes: { type: string }
+        mobileDeviceId: { type: string }
+    FuelRequestCreateRequest:
+      type: object
+      required: [vehicleKey, amountRequested]
+      properties:
+        vehicleKey: { type: integer }
+        requestType: { $ref: '#/components/schemas/FuelRequestType' }
+        amountRequested: { type: number }
+        litersRequested: { type: number }
+        reason: { type: string }
+        mobileDeviceId: { type: string }
+    FuelApproveRequest:
+      type: object
+      required: [approvalStatus]
+      properties:
+        approvalStatus: { $ref: '#/components/schemas/FuelDecisionStatus' }
+        approvalNotes: { type: string }
+        disbursedAmount: { type: number, description: Recorded only on APPROVED }
+    FuelLogRequest:
+      type: object
+      required: [vehicleKey, odometerReading, litersFilled]
+      properties:
+        vehicleKey: { type: integer }
+        fuelRequestKey: { type: integer }
+        odometerReading: { type: number, description: Must be >= vehicle's current odometer }
+        litersFilled: { type: number }
+        costPerLiter: { type: number }
+        totalCost: { type: number }
+        stationName: { type: string }
+        receiptPhotoUrl: { type: string, description: Signed URL from POST /uploads (purpose RECEIPT_PHOTO) }
+        mobileDeviceId: { type: string }
+    MaintenanceCreateRequest:
+      type: object
+      required: [vehicleKey, maintenanceType, description]
+      properties:
+        vehicleKey: { type: integer }
+        maintenanceType: { $ref: '#/components/schemas/MaintenanceType' }
+        priority: { $ref: '#/components/schemas/Priority' }
+        description: { type: string }
+        estimatedCost: { type: number, description: Above MAINTENANCE_MD_THRESHOLD (default 100000) triggers the MD approval flow }
+        mobileDeviceId: { type: string }
+    MaintenanceStatusRequest:
+      type: object
+      required: [maintenanceStatus]
+      properties:
+        maintenanceStatus: { $ref: '#/components/schemas/MaintenanceStatus' }
+        completionNotes: { type: string }
+        actualCost: { type: number }
+        vendorName: { type: string }
+        invoiceNumber: { type: string }
+    GrnCreateRequest:
+      type: object
+      required: [lines]
+      properties:
+        mobileDeviceId: { type: string }
+        supplierKey: { type: integer, description: Global supplier; validated when present }
+        waybillNumber: { type: string }
+        invoiceNumber: { type: string }
+        truckPlateNumber: { type: string }
+        driverName: { type: string }
+        sealNumber: { type: string }
+        sealIntact: { type: boolean }
+        totalInvoiceQty: { type: integer, description: Defaults to the sum over lines }
+        totalReceivedQty: { type: integer, description: Defaults to the sum over lines }
+        totalRejectedQty: { type: integer, description: Defaults to the sum over lines }
+        rejectionReason: { type: string }
+        lines:
+          type: array
+          minItems: 1
+          description: At least one line required
+          items:
+            type: object
+            required: [productKey]
+            properties:
+              productKey: { type: integer, description: Must belong to the caller's business }
+              invoiceQty: { type: integer, minimum: 0, default: 0 }
+              receivedQty: { type: integer, minimum: 0, default: 0 }
+              rejectedQty: { type: integer, minimum: 0, default: 0 }
+              productionDate: { type: string, format: date }
+              expiryDate: { type: string, format: date }
+              batchNumber: { type: string }
+              isDamaged: { type: boolean }
+              isExpired: { type: boolean }
+              isNearExpiry: { type: boolean }
+              nearExpiryDays: { type: integer }
+              rejectionReason: { type: string }
+              allocatedLocation: { type: string, description: e.g. MAIN; drives the stock movement location }
+              fifoCompliant: { type: boolean }
+    DispatchCreateRequest:
+      type: object
+      required: [customerKey, invoiceNumber, lines]
+      properties:
+        mobileDeviceId: { type: string }
+        customerKey: { type: integer, description: Must belong to the caller's business }
+        invoiceNumber: { type: string }
+        driverKey: { type: integer, description: Optional; validated against the business when present }
+        vehicleKey: { type: integer, description: Optional; validated against the business when present }
+        lines:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [productKey]
+            properties:
+              productKey: { type: integer }
+              invoiceQty: { type: integer, default: 0 }
+              pickedQty: { type: integer, default: 0 }
+              loadedQty: { type: integer, default: 0 }
+              unitPrice: { type: number }
+    CustomerAckRequest:
+      type: object
+      properties:
+        mobileDeviceId: { type: string }
+        customerSignatureUrl:
+          type: string
+          description: Signed URL from POST /uploads (purpose CUSTOMER_SIGNATURE)
+        returned:
+          type: boolean
+          description: True marks the dispatch RETURNED instead of DELIVERED
+        returnReason: { type: string, description: Required in effect when returned is true }
+        lineDeliveries:
+          type: array
+          description: Optional per-line delivered/returned quantities
+          items:
+            type: object
+            required: [lineKey]
+            properties:
+              lineKey: { type: integer, description: fact_dispatch_line.dispatch_line_key }
+              deliveredQty: { type: integer, default: 0 }
+              returnedQty: { type: integer, default: 0 }
+    ManualMovementRequest:
+      type: object
+      required: [productKey, movementType, quantity]
+      properties:
+        mobileDeviceId: { type: string }
+        productKey: { type: integer }
+        movementType: { $ref: '#/components/schemas/ManualMovementType' }
+        quantity: { type: integer, exclusiveMinimum: 0 }
+        warehouseLocation: { type: string, default: MAIN }
+        toBusinessKey: { type: integer, description: Required for TRANSFER_OUT }
+        fromWarehouse: { type: string }
+        toWarehouse: { type: string }
+        unitCost: { type: number, description: total_value is computed as unitCost x quantity }
+        notes: { type: string }
+    StockCountRequest:
+      type: object
+      required: [productKey, systemQty, physicalCount]
+      properties:
+        mobileDeviceId: { type: string }
+        productKey: { type: integer }
+        warehouseLocation: { type: string, default: MAIN }
+        systemQty: { type: integer }
+        physicalCount: { type: integer }
+        witnessedByKey: { type: integer }
+        varianceReason: { type: string, description: Defaults to Unexplained when variance != 0 }
+    GoodsReturnRequest:
+      type: object
+      required: [customerKey, productKey, returnType, quantityReturned]
+      properties:
+        mobileDeviceId: { type: string }
+        customerKey: { type: integer }
+        productKey: { type: integer }
+        returnType: { $ref: '#/components/schemas/ReturnType' }
+        originalInvoice: { type: string }
+        batchNumber: { type: string }
+        quantityReturned: { type: integer, exclusiveMinimum: 0 }
+        creditNoteRequested: { type: boolean }
+    SyncBatchRequest:
+      type: object
+      required: [deviceId, items]
+      properties:
+        deviceId: { type: string }
+        items:
+          type: array
+          minItems: 1
+          description: Server enforces a configurable cap (SYNC_BATCH_SIZE app config, default 50); larger batches return 400
+          items:
+            type: object
+            required: [clientRef, entityType, payload]
+            properties:
+              clientRef:
+                type: string
+                maxLength: 100
+                description: Client-generated unique reference - the idempotency key
+              entityType: { $ref: '#/components/schemas/SyncEntityType' }
+              payload:
+                type: object
+                description: |
+                  Entity-specific payload, same shape as the corresponding
+                  online request body (oneOf below). DISPATCH_ACK additionally
+                  requires stage (WAREHOUSE | SECURITY | DRIVER | CUSTOMER) and
+                  dispatchKey. Unknown extra key clientRef is merged in by the
+                  server on enqueue.
+                oneOf:
+                  - $ref: '#/components/schemas/VehicleCheckRequest'
+                  - $ref: '#/components/schemas/TripStartRequest'
+                  - $ref: '#/components/schemas/TripEndRequest'
+                  - $ref: '#/components/schemas/FuelRequestCreateRequest'
+                  - $ref: '#/components/schemas/FuelLogRequest'
+                  - $ref: '#/components/schemas/MaintenanceCreateRequest'
+                  - $ref: '#/components/schemas/GrnCreateRequest'
+                  - $ref: '#/components/schemas/CustomerAckRequest'
+                  - $ref: '#/components/schemas/StockCountRequest'
+                  - $ref: '#/components/schemas/ManualMovementRequest'
+                  - $ref: '#/components/schemas/GoodsReturnRequest'
+                  - $ref: '#/components/schemas/DispatchAckPayload'
+    DispatchAckPayload:
+      type: object
+      required: [dispatchKey, stage]
+      description: SYNC entity DISPATCH_ACK - custody-chain stamping from the mobile app
+      properties:
+        dispatchKey: { type: integer }
+        stage:
+          type: string
+          enum: [WAREHOUSE, SECURITY, DRIVER, CUSTOMER]
+        loadedQuantities:
+          type: array
+          items:
+            type: object
+            properties:
+              lineKey: { type: integer }
+              loadedQty: { type: integer }
+        driverSignatureUrl: { type: string }
+        customerSignatureUrl: { type: string }
+        returned: { type: boolean }
+        returnReason: { type: string }
+        lineDeliveries:
+          type: array
+          items:
+            type: object
+            properties:
+              lineKey: { type: integer }
+              deliveredQty: { type: integer }
+              returnedQty: { type: integer }
+        mobileDeviceId: { type: string }
+    SyncItemResult:
+      type: object
+      properties:
+        clientRef: { type: string, nullable: true }
+        queueId: { type: integer, nullable: true, description: Set for QUEUED / DUPLICATE_ACK / ALREADY_QUEUED }
+        status:
+          type: string
+          enum: [QUEUED, DUPLICATE_ACK, ALREADY_QUEUED, REJECTED]
+        message:
+          type: string
+          nullable: true
+          description: Populated for DUPLICATE_ACK ("Item already received") and REJECTED (reason)
+    ProcessingSummary:
+      type: object
+      properties:
+        processed: { type: integer }
+        synced: { type: integer }
+        failed: { type: integer }
+        conflicts: { type: integer }
+        deadLettered: { type: integer }
+        reclaimed: { type: integer }
+    QueueStatusRow:
+      type: object
+      properties:
+        device_id: { type: string }
+        total_queued: { type: integer }
+        pending: { type: integer }
+        processing: { type: integer }
+        synced: { type: integer }
+        failed: { type: integer }
+        conflict: { type: integer }
+        dead_letter: { type: integer }
+        last_push_at: { type: string, format: date-time, nullable: true }
+        last_processed_at: { type: string, format: date-time, nullable: true }
+    ConflictRow:
+      type: object
+      description: Both versions exposed for a reconciliation screen
+      properties:
+        conflict_key: { type: integer }
+        queue_id: { type: integer }
+        entity_type: { type: string }
+        entity_key: { type: integer, nullable: true }
+        server_version_json: { type: string, nullable: true, description: JSON-encoded server version }
+        client_version_json: { type: string, nullable: true, description: JSON-encoded client version }
+        resolution: { type: string, example: PENDING }
+        created_at: { type: string, format: date-time }
+        device_id: { type: string }
+        retry_count: { type: integer }
+        queued_at: { type: string, format: date-time }
+    ConflictResolveRequest:
+      type: object
+      required: [resolution]
+      properties:
+        resolution: { $ref: '#/components/schemas/ConflictResolution' }
+        mergedPayload:
+          type: object
+          description: Required for MERGED - overlaid onto the client payload before re-apply
+        resolutionNotes: { type: string }
+    PullRequest:
+      type: object
+      properties:
+        cursor:
+          type: object
+          description: 'Map of dataset to last applied changeKey; 0 or absent = full snapshot'
+          additionalProperties: { type: integer, minimum: 0 }
+        pageSize:
+          type: integer
+          description: Clamped to 1..max(SYNC_PULL_PAGE_SIZE default 200, 200)
+        datasets:
+          type: array
+          items: { $ref: '#/components/schemas/PullDataset' }
+        snapshotAfterKey:
+          type: object
+          description: Echo-back value from the previous snapshot page (last entityKey per dataset)
+          additionalProperties: { type: integer, minimum: 0 }
+    ChangeRow:
+      type: object
+      properties:
+        entityType: { $ref: '#/components/schemas/PullDataset' }
+        entityKey: { type: integer }
+        op:
+          type: string
+          enum: [UPSERT, DELETE]
+          description: DELETE = tombstone, payload is null - clients drop the row
+        versionNo: { type: integer }
+        changeKey: { type: integer }
+        payload:
+          type: object
+          nullable: true
+          description: Full row snapshot; null for DELETE tombstones
+    UploadStored:
+      type: object
+      properties:
+        storageKey:
+          type: string
+          description: 'Opaque path: businessKey/purpose/uuid.ext'
+        url:
+          type: string
+          description: Signed retrieval URL (GET /uploads/content/{token}), default TTL 900s
+        expiresAt: { type: string, format: date-time }
+        mime: { type: string, example: image/jpeg }
+        bytes: { type: integer }
+    Vehicle:
+      type: object
+      description: Snake_case columns from dim_vehicle
+      properties:
+        vehicle_key: { type: integer }
+        vehicle_id: { type: string, example: VAN-001 }
+        business_key: { type: integer }
+        plate_number: { type: string }
+        make: { type: string, nullable: true }
+        model: { type: string, nullable: true }
+        year_manufactured: { type: integer, nullable: true }
+        capacity_kg: { type: number, nullable: true }
+        fuel_type: { type: string, example: PETROL }
+        assigned_driver_key: { type: integer, nullable: true }
+        assigned_driver_name: { type: string, nullable: true }
+        current_odometer: { type: number }
+        status: { $ref: '#/components/schemas/VehicleStatus' }
+        registration_expiry: { type: string, format: date, nullable: true }
+        insurance_expiry: { type: string, format: date, nullable: true }
+        last_service_date: { type: string, format: date, nullable: true }
+        next_service_due: { type: string, format: date, nullable: true }
+        is_active: { type: integer, enum: [0, 1] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    VehicleCheck:
+      type: object
+      properties:
+        check_key: { type: integer }
+        business_key: { type: integer }
+        vehicle_key: { type: integer }
+        vehicle_id: { type: string }
+        plate_number: { type: string }
+        driver_key: { type: integer }
+        driver_name: { type: string }
+        date_key: { type: integer }
+        check_datetime: { type: string, format: date-time }
+        latitude: { type: number, nullable: true }
+        longitude: { type: number, nullable: true }
+        tires_ok: { type: integer, enum: [0, 1] }
+        lights_ok: { type: integer, enum: [0, 1] }
+        brakes_ok: { type: integer, enum: [0, 1] }
+        engine_ok: { type: integer, enum: [0, 1] }
+        oil_level_ok: { type: integer, enum: [0, 1] }
+        coolant_ok: { type: integer, enum: [0, 1] }
+        wipers_ok: { type: integer, enum: [0, 1] }
+        mirrors_ok: { type: integer, enum: [0, 1] }
+        seatbelts_ok: { type: integer, enum: [0, 1] }
+        fire_extinguisher_ok: { type: integer, enum: [0, 1] }
+        first_aid_kit_ok: { type: integer, enum: [0, 1] }
+        has_damage: { type: integer, enum: [0, 1] }
+        damage_description: { type: string, nullable: true }
+        damage_photo_url: { type: string, nullable: true }
+        check_status: { $ref: '#/components/schemas/CheckStatus' }
+        mobile_device_id: { type: string, nullable: true }
+    Trip:
+      type: object
+      properties:
+        trip_key: { type: integer }
+        vehicle_key: { type: integer }
+        vehicle_id: { type: string }
+        plate_number: { type: string }
+        driver_key: { type: integer }
+        driver_name: { type: string }
+        route_key: { type: integer, nullable: true }
+        route_name: { type: string, nullable: true }
+        date_key: { type: integer }
+        trip_start_time: { type: string, format: date-time }
+        start_odometer: { type: number }
+        start_latitude: { type: number, nullable: true }
+        start_longitude: { type: number, nullable: true }
+        trip_end_time: { type: string, format: date-time, nullable: true }
+        end_odometer: { type: number, nullable: true }
+        end_latitude: { type: number, nullable: true }
+        end_longitude: { type: number, nullable: true }
+        distance_km: { type: number, nullable: true }
+        stores_visited: { type: integer, nullable: true }
+        delivery_success_count: { type: integer, nullable: true }
+        delivery_fail_count: { type: integer, nullable: true }
+        trip_status: { $ref: '#/components/schemas/TripStatus' }
+        driver_notes: { type: string, nullable: true }
+        mobile_device_id: { type: string, nullable: true }
+    FuelRequest:
+      type: object
+      properties:
+        fuel_request_key: { type: integer }
+        vehicle_key: { type: integer }
+        vehicle_id: { type: string }
+        plate_number: { type: string }
+        driver_key: { type: integer }
+        driver_name: { type: string }
+        request_datetime: { type: string, format: date-time }
+        request_type: { $ref: '#/components/schemas/FuelRequestType' }
+        amount_requested: { type: number, nullable: true }
+        liters_requested: { type: number, nullable: true }
+        reason: { type: string, nullable: true }
+        approval_status: { $ref: '#/components/schemas/FuelRequestStatus' }
+        approved_by_key: { type: integer, nullable: true }
+        approved_by_name: { type: string, nullable: true }
+        approved_datetime: { type: string, format: date-time, nullable: true }
+        approval_notes: { type: string, nullable: true }
+        disbursed_amount: { type: number, nullable: true }
+    Maintenance:
+      type: object
+      properties:
+        maintenance_key: { type: integer }
+        vehicle_key: { type: integer }
+        vehicle_id: { type: string }
+        plate_number: { type: string }
+        reported_by_key: { type: integer }
+        reported_by_name: { type: string }
+        maintenance_type: { $ref: '#/components/schemas/MaintenanceType' }
+        priority: { $ref: '#/components/schemas/Priority' }
+        description: { type: string }
+        estimated_cost: { type: number, nullable: true }
+        actual_cost: { type: number, nullable: true }
+        approval_status: { $ref: '#/components/schemas/ApprovalStatus' }
+        ops_approved_by_key: { type: integer, nullable: true }
+        ops_approved_by_name: { type: string, nullable: true }
+        md_approved_by_key: { type: integer, nullable: true }
+        md_approved_by_name: { type: string, nullable: true }
+        maintenance_status: { $ref: '#/components/schemas/MaintenanceStatus' }
+        vendor_name: { type: string, nullable: true }
+        work_start_date: { type: string, format: date, nullable: true }
+        work_completion_date: { type: string, format: date, nullable: true }
+        invoice_number: { type: string, nullable: true }
+        completion_notes: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+    Route:
+      type: object
+      properties:
+        route_key: { type: integer }
+        route_id: { type: string, example: RT-KETU-A }
+        business_key: { type: integer }
+        route_name: { type: string }
+        region: { type: string, nullable: true }
+        neighborhood: { type: string, nullable: true }
+        estimated_distance_km: { type: number, nullable: true }
+        estimated_stores: { type: integer, nullable: true }
+        assigned_vehicle_key: { type: integer, nullable: true }
+        vehicle_id: { type: string, nullable: true }
+        plate_number: { type: string, nullable: true }
+        driver_name: { type: string, nullable: true }
+        is_active: { type: integer, enum: [0, 1] }
+    Grn:
+      type: object
+      properties:
+        grn_key: { type: integer }
+        business_key: { type: integer }
+        supplier_key: { type: integer, nullable: true }
+        supplier_name: { type: string, nullable: true }
+        received_by_key: { type: integer }
+        received_by_name: { type: string }
+        date_key: { type: integer }
+        grn_number: { type: string, example: GRN-KETU-20260910-001 }
+        waybill_number: { type: string, nullable: true }
+        invoice_number: { type: string, nullable: true }
+        truck_plate_number: { type: string, nullable: true }
+        driver_name: { type: string, nullable: true }
+        seal_number: { type: string, nullable: true }
+        seal_intact: { type: integer, enum: [0, 1] }
+        receipt_status: { $ref: '#/components/schemas/ReceiptStatus' }
+        total_invoice_qty: { type: integer, nullable: true }
+        total_received_qty: { type: integer, nullable: true }
+        total_rejected_qty: { type: integer, nullable: true }
+        rejection_reason: { type: string, nullable: true }
+        finance_signoff: { type: integer, enum: [0, 1] }
+        credit_note_issued: { type: integer, enum: [0, 1] }
+        credit_note_number: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        mobile_device_id: { type: string, nullable: true }
+    GrnLine:
+      type: object
+      properties:
+        grn_line_key: { type: integer }
+        grn_key: { type: integer }
+        product_key: { type: integer }
+        sku_code: { type: string }
+        product_name: { type: string }
+        unit_of_measure: { type: string }
+        invoice_qty: { type: integer }
+        received_qty: { type: integer }
+        rejected_qty: { type: integer }
+        production_date: { type: string, format: date, nullable: true }
+        expiry_date: { type: string, format: date, nullable: true }
+        batch_number: { type: string, nullable: true }
+        is_damaged: { type: integer, enum: [0, 1] }
+        is_expired: { type: integer, enum: [0, 1] }
+        is_near_expiry: { type: integer, enum: [0, 1] }
+        near_expiry_days: { type: integer, nullable: true }
+        rejection_reason: { type: string, nullable: true }
+        allocated_location: { type: string, nullable: true }
+        fifo_compliant: { type: integer, enum: [0, 1] }
+    Dispatch:
+      type: object
+      properties:
+        dispatch_key: { type: integer }
+        business_key: { type: integer }
+        customer_key: { type: integer }
+        customer_name: { type: string }
+        dispatched_by_key: { type: integer }
+        dispatched_by_name: { type: string }
+        driver_key: { type: integer, nullable: true }
+        driver_name: { type: string, nullable: true }
+        vehicle_key: { type: integer, nullable: true }
+        plate_number: { type: string, nullable: true }
+        date_key: { type: integer }
+        dispatch_number: { type: string, example: DSP-KETU-20260910-001 }
+        invoice_number: { type: string }
+        warehouse_stamp: { type: integer, enum: [0, 1] }
+        warehouse_signed_by_key: { type: integer, nullable: true }
+        warehouse_sign_datetime: { type: string, format: date-time, nullable: true }
+        security_stamp: { type: integer, enum: [0, 1] }
+        security_signed_by_key: { type: integer, nullable: true }
+        security_sign_datetime: { type: string, format: date-time, nullable: true }
+        driver_acknowledged: { type: integer, enum: [0, 1] }
+        driver_ack_datetime: { type: string, format: date-time, nullable: true }
+        driver_signature_url: { type: string, nullable: true }
+        dispatch_status: { $ref: '#/components/schemas/DispatchStatus' }
+        delivery_datetime: { type: string, format: date-time, nullable: true }
+        customer_acknowledged: { type: integer, enum: [0, 1] }
+        customer_signature_url: { type: string, nullable: true }
+        return_reason: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        mobile_device_id: { type: string, nullable: true }
+    DispatchLine:
+      type: object
+      properties:
+        dispatch_line_key: { type: integer }
+        dispatch_key: { type: integer }
+        product_key: { type: integer }
+        sku_code: { type: string }
+        product_name: { type: string }
+        unit_of_measure: { type: string }
+        invoice_qty: { type: integer }
+        picked_qty: { type: integer }
+        loaded_qty: { type: integer }
+        delivered_qty: { type: integer }
+        returned_qty: { type: integer }
+        unit_price: { type: number, nullable: true }
+        line_total: { type: number, nullable: true }
+    StockMovement:
+      type: object
+      properties:
+        movement_key: { type: integer }
+        business_key: { type: integer }
+        product_key: { type: integer }
+        sku_code: { type: string }
+        product_name: { type: string }
+        warehouse_location: { type: string, nullable: true }
+        date_key: { type: integer }
+        movement_type: { $ref: '#/components/schemas/MovementType' }
+        reference_key: { type: integer, nullable: true }
+        reference_type: { type: string, nullable: true }
+        quantity: { type: integer }
+        unit_cost: { type: number, nullable: true }
+        total_value: { type: number, nullable: true }
+        from_business_key: { type: integer, nullable: true }
+        to_business_key: { type: integer, nullable: true }
+        from_warehouse: { type: string, nullable: true }
+        to_warehouse: { type: string, nullable: true }
+        notes: { type: string, nullable: true }
+        recorded_by_key: { type: integer }
+        recorded_by_name: { type: string }
+        created_at: { type: string, format: date-time }
+        mobile_device_id: { type: string, nullable: true }
+    StockCount:
+      type: object
+      properties:
+        count_key: { type: integer }
+        business_key: { type: integer }
+        product_key: { type: integer }
+        sku_code: { type: string }
+        product_name: { type: string }
+        warehouse_location: { type: string, nullable: true }
+        date_key: { type: integer }
+        counted_by_key: { type: integer }
+        counted_by_name: { type: string }
+        witnessed_by_key: { type: integer, nullable: true }
+        system_qty: { type: integer }
+        physical_count: { type: integer }
+        variance: { type: integer, nullable: true }
+        variance_reason: { type: string, nullable: true }
+        investigation_status: { type: string, enum: [OPEN, RESOLVED, ESCALATED] }
+        manager_decision: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        mobile_device_id: { type: string, nullable: true }
+    GoodsReturn:
+      type: object
+      properties:
+        return_key: { type: integer }
+        business_key: { type: integer }
+        customer_key: { type: integer }
+        customer_name: { type: string }
+        product_key: { type: integer }
+        sku_code: { type: string }
+        product_name: { type: string }
+        returned_by_key: { type: integer }
+        returned_by_name: { type: string }
+        date_key: { type: integer }
+        return_type: { $ref: '#/components/schemas/ReturnType' }
+        original_invoice: { type: string, nullable: true }
+        batch_number: { type: string, nullable: true }
+        quantity_returned: { type: integer }
+        credit_note_requested: { type: integer, enum: [0, 1] }
+        return_status: { $ref: '#/components/schemas/ReturnStatus' }
+        created_at: { type: string, format: date-time }
+        mobile_device_id: { type: string, nullable: true }
+    StockPositionRow:
+      type: object
+      description: Row from the vw_stock_position view (snake_case)
+      properties:
+        business_key: { type: integer }
+        business_name: { type: string }
+        product_key: { type: integer }
+        sku_code: { type: string }
+        product_name: { type: string }
+        brand: { type: string, nullable: true }
+        category: { type: string, nullable: true }
+        warehouse_location: { type: string, nullable: true }
+        total_in: { type: integer, nullable: true }
+        total_out: { type: integer, nullable: true }
+        current_stock: { type: integer, nullable: true }
+        last_movement_date: { type: string, format: date-time, nullable: true }
+    UserRole:
+      type: string
+      enum: [DRIVER, FLEET_MANAGER, WAREHOUSE_MANAGER, WAREHOUSE_STAFF, OPS_MANAGER, SECURITY, ADMIN]
+    VehicleStatus:
+      type: string
+      enum: [ACTIVE, IN_WORKSHOP, ON_ROUTE, RETIRED, SOLD]
+    CheckStatus:
+      type: string
+      enum: [PASS, FAIL, PASS_WITH_ISSUES]
+    TripStatus:
+      type: string
+      enum: [PLANNED, STARTED, IN_PROGRESS, COMPLETED, CANCELLED]
+    FuelRequestStatus:
+      type: string
+      enum: [PENDING, APPROVED, REJECTED]
+    FuelDecisionStatus:
+      type: string
+      enum: [APPROVED, REJECTED]
+    FuelRequestType:
+      type: string
+      enum: [CASH, FUEL_CARD, EMERGENCY]
+      default: CASH
+    ApprovalStatus:
+      type: string
+      enum: [PENDING, OPS_APPROVED, MD_APPROVED, REJECTED]
+    MaintenanceStatus:
+      type: string
+      enum: [OPEN, IN_PROGRESS, COMPLETED, CANCELLED]
+    MaintenanceType:
+      type: string
+      enum: [SCHEDULED, REPAIR, ACCIDENT, INSPECTION]
+    Priority:
+      type: string
+      enum: [LOW, MEDIUM, HIGH, CRITICAL]
+      default: MEDIUM
+    DispatchStatus:
+      type: string
+      enum: [PENDING, PICKED, LOADED, IN_TRANSIT, DELIVERED, RETURNED]
+    ReceiptStatus:
+      type: string
+      enum: [PENDING, PARTIAL, COMPLETE, REJECTED]
+    MovementType:
+      type: string
+      enum: [RECEIPT, DISPATCH, TRANSFER_IN, TRANSFER_OUT, ADJUSTMENT, DAMAGED, EXPIRED, COUNT]
+    ManualMovementType:
+      type: string
+      enum: [ADJUSTMENT, TRANSFER_IN, TRANSFER_OUT, DAMAGED, EXPIRED]
+      description: RECEIPT / DISPATCH / COUNT are system-generated only
+    ReturnStatus:
+      type: string
+      enum: [PENDING, CONFIRMED, CREDIT_ISSUED, REJECTED]
+    ReturnType:
+      type: string
+      enum: [DAMAGED, EXPIRED, WRONG_ORDER, QUALITY_ISSUE]
+    ConflictResolution:
+      type: string
+      enum: [SERVER_WINS, CLIENT_WINS, MERGED]
+    UploadPurpose:
+      type: string
+      enum: [DAMAGE_PHOTO, RECEIPT_PHOTO, DRIVER_SIGNATURE, CUSTOMER_SIGNATURE, GENERAL]
+      default: GENERAL
+    SyncEntityType:
+      type: string
+      enum: [VEHICLE_CHECK, TRIP_START, TRIP_END, FUEL_REQUEST, FUEL_LOG, MAINTENANCE, GRN, DISPATCH_ACK, STOCK_COUNT, STOCK_MOVEMENT, GOODS_RETURN]
+    PullDataset:
+      type: string
+      enum: [VEHICLES, ROUTES, CUSTOMERS, PRODUCTS, DISPATCHES, GRNS]
+

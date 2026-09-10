@@ -15,31 +15,20 @@ const sql = require('mssql');
 const { env } = require('../../src/config/env');
 const { executeQuery, closePool } = require('../../src/config/db');
 
-/* Migration scripts live in backend/database (02-05) while 01 ships in the
-   repo-root database/ folder; resolve each by existence so both layouts
-   work. 05 is required because service writes emit sync_change_log rows
-   (transactional outbox) inside their write transactions. 03/04 are
-   skipped: 03 creates a least-privilege login with a placeholder password
-   (not applicable to sa-run test containers), 04 forces password rotation
-   which clearRotationFlags() already neutralizes per-suite. */
-const MIGRATION_DIRS = [
-  path.join(__dirname, '..', '..', 'database'),
-  path.join(__dirname, '..', '..', '..', 'database')
-];
-
-function resolveMigration(file) {
-  const found = MIGRATION_DIRS.map((dir) => path.join(dir, file)).find((p) => fs.existsSync(p));
-  if (!found) {
-    throw new Error(`Migration ${file} not found under ${MIGRATION_DIRS.join(' or ')}`);
-  }
-  return found;
-}
+/* All migrations (01-05) live in backend/database, the single canonical
+   migration directory (also read by scripts/migrate.js). 05 is required
+   because service writes emit sync_change_log rows (transactional outbox)
+   inside their write transactions. 03/04 are skipped: 03 creates a
+   least-privilege login with a placeholder password (not applicable to
+   sa-run test containers), 04 forces password rotation which
+   clearRotationFlags() already neutralizes per-suite. */
+const MIGRATIONS_DIR = path.join(__dirname, '..', '..', 'database');
 
 const MIGRATIONS = [
   '01_create_database.sql',
   '02_sync_queue.sql',
   '05_pull_change_log.sql'
-].map(resolveMigration);
+].map((file) => path.join(MIGRATIONS_DIR, file));
 
 /** Raw one-off connection (used for bootstrapping master-level work). */
 async function rawConnect(database) {
