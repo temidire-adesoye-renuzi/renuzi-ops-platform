@@ -186,17 +186,18 @@ GO
 
 -- GET /api/warehouse/stock-position + /api/dashboard/stock-position read
 -- vw_stock_position, which groups fact_stock_movement by (product_key,
--- warehouse_location) and sums movement_type-filtered quantities. This
--- index matches the aggregate's shape so the view's per-product scan
--- becomes a covered range scan.
+-- warehouse_location) and sums movement_type-filtered quantities. Every
+-- consumer scopes the view by business_key (TD-12), so business_key LEADS
+-- the key: the aggregate becomes a covered seek per business, and each
+-- (product, location) group is contiguous within it.
 IF NOT EXISTS (
     SELECT 1 FROM sys.indexes
      WHERE name = 'IX_fact_stock_movement_product_location'
        AND object_id = OBJECT_ID('fact_stock_movement')
 )
     CREATE INDEX IX_fact_stock_movement_product_location
-        ON fact_stock_movement(product_key, warehouse_location)
-        INCLUDE (business_key, movement_type, quantity, created_at);
+        ON fact_stock_movement(business_key, product_key, warehouse_location)
+        INCLUDE (movement_type, quantity, created_at);
 GO
 
 -- ============================================================================
@@ -219,7 +220,11 @@ GO
 
 -- GET /api/sync/conflicts: pending-conflict feed (listPendingConflicts)
 -- filters resolution = 'PENDING' and sorts created_at DESC. The PK
--- tiebreak keeps keyset pages deterministic; migration 02's
+-- tiebreak keeps keyset pages deterministic. The NVARCHAR(MAX) version
+-- JSON columns are deliberately NOT included: key-lookup to the base row
+-- for 50 feed rows is cheap, while duplicating every payload into the
+-- index leaf on every insert would tax the conflict path (writes are the
+-- rare event this feed exists for). Migration 02's
 -- IX_sync_conflict_resolution(resolution, created_at) stays valid for the
 -- un-tiebroken form.
 IF NOT EXISTS (
@@ -229,7 +234,7 @@ IF NOT EXISTS (
 )
     CREATE INDEX IX_sync_conflict_log_pending_feed
         ON sync_conflict_log(resolution, created_at DESC, conflict_key DESC)
-        INCLUDE (queue_id, entity_type, entity_key, server_version_json, client_version_json);
+        INCLUDE (queue_id, entity_type, entity_key);
 GO
 
 -- ============================================================================
